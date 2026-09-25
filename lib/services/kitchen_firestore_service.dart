@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 
 import '../models/display_controls.dart';
 import '../models/kitchen_order.dart';
@@ -239,9 +240,13 @@ class KitchenFirestoreService {
           'lastErrorAt': lastErrorAt,
           'lastError': lastError,
         }, SetOptions(merge: true)).timeout(_kHeartbeatCallTimeout);
-      } catch (_) {
+      } catch (e) {
         // Telemetry is best-effort — a permission or timeout failure here
-        // must never block the reconnect/resubscribe below.
+        // must never block the reconnect/resubscribe below. Logged (not
+        // swallowed silently) so a missing Firestore security rule for this
+        // path shows up as "permission-denied" in `adb logcat` instead of
+        // just... nothing ever appearing in the devices/ collection.
+        debugPrint('kitchen telemetry write failed: $e');
       }
       if (_disposed) return;
 
