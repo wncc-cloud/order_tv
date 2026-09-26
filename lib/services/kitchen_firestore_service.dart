@@ -36,6 +36,14 @@ const Duration kHeartbeatResubscribeInterval = Duration(minutes: 3);
 /// skipping one.
 const Duration _kHeartbeatCallTimeout = Duration(seconds: 10);
 
+/// Dedupe window for [KitchenFirestoreService._logTvError]. The kitchen/
+/// controls resubscribe backoff already caps retries at 60 seconds
+/// ([kReconnectBackoffSeconds]), so without a dedupe window a sustained
+/// outage would write one near-identical `TV_ERROR` log entry every 60
+/// seconds, indefinitely. 5 minutes comfortably exceeds that ceiling, so a
+/// long outage collapses into one entry every 5 minutes instead.
+const Duration _kTvErrorDedupeWindow = Duration(minutes: 5);
+
 /// Wraps the two `.snapshots()` listeners this screen needs, with automatic
 /// resubscription (capped backoff) on terminal stream errors. Firestore's
 /// SDK already transparently rides out transient blips (wifi drop, brief
@@ -63,6 +71,18 @@ class KitchenFirestoreService {
   int _controlsBackoffIndex = 0;
   bool _disposed = false;
   bool _heartbeatRunning = false;
+
+  /// Set once [startHeartbeat] is called, and never cleared — used by
+  /// [logRestartEvent] so the screen can log a restart without needing to
+  /// track its own separate copy of the device id.
+  String? _deviceId;
+
+  /// Keyed by the first 200 chars of the error message, same coarse-dedupe
+  /// shape as `ClientLogRepository._lastLoggedAt` on the billing_cafe side
+  /// (`TV_ERROR_LOGS_PLAN.md`) — deliberately coarse, since bounding
+  /// worst-case write volume from one repeating error matters more than
+  /// per-occurrence fidelity.
+  final Map<String, DateTime> _lastTvErrorLoggedAt = {};
 
   void Function(List<KitchenOrder> orders, bool exists)? _kitchenOnData;
   void Function(Object error)? _kitchenOnStreamError;
@@ -122,6 +142,7 @@ class KitchenFirestoreService {
         } catch (e) {
           lastErrorAt = DateTime.now();
           lastError = 'kitchen parse: $e';
+          if (_deviceId != null) unawaited(_logTvError(_deviceId!, 'kitchen parse: $e'));
           onParseError(e);
           onData(const [], snapshot.exists);
         }
@@ -129,6 +150,7 @@ class KitchenFirestoreService {
       onError: (Object error) {
         lastErrorAt = DateTime.now();
         lastError = 'kitchen stream: $error';
+        if (_deviceId != null) unawaited(_logTvError(_deviceId!, 'kitchen stream: $error'));
         onStreamError(error);
         _scheduleKitchenResubscribe(onData, onStreamError, onParseError);
       },
@@ -183,6 +205,7 @@ class KitchenFirestoreService {
         } catch (e) {
           lastErrorAt = DateTime.now();
           lastError = 'controls parse: $e';
+          if (_deviceId != null) unawaited(_logTvError(_deviceId!, 'controls parse: $e'));
           onParseError(e);
           onData(true, snapshot.exists);
         }
@@ -190,6 +213,7 @@ class KitchenFirestoreService {
       onError: (Object error) {
         lastErrorAt = DateTime.now();
         lastError = 'controls stream: $error';
+        if (_deviceId != null) unawaited(_logTvError(_deviceId!, 'controls stream: $error'));
         onStreamError(error);
         _scheduleControlsResubscribe(onData, onStreamError, onParseError);
       },
@@ -218,10 +242,64 @@ class KitchenFirestoreService {
   /// call more than once — it replaces any existing heartbeat timer rather
   /// than stacking a second one.
   void startHeartbeat({required String deviceId}) {
+    _deviceId = deviceId;
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(kHeartbeatResubscribeInterval, (_) {
       unawaited(_runHeartbeat(deviceId));
     });
+  }
+
+  /// Best-effort log of a stream/parse error into `clientLogs`, tagged
+  /// `type: 'TV_ERROR'` — a durable history entry, distinct from the
+  /// current-state-only `devices/{deviceId}` heartbeat doc above.
+  /// `TV_ERROR_LOGS_PLAN.md` section 2 has the full design rationale (why
+  /// this collection, why the dedupe window, why the exact field shape).
+  Future<void> _logTvError(String deviceId, String message) async {
+    final dedupeKey = message.length > 200 ? message.substring(0, 200) : message;
+    final now = DateTime.now();
+    // Prune first, same as `ClientLogRepository._pruneExpired` on the
+    // billing_cafe side — without this the map grows one entry per distinct
+    // error message ever seen, for the life of the process. This kiosk is
+    // designed to stay up for weeks/months between restarts, so that matters
+    // more here than it does for a web session that reloads far more often.
+    _lastTvErrorLoggedAt.removeWhere(
+      (_, at) => now.difference(at) >= _kTvErrorDedupeWindow,
+    );
+    final last = _lastTvErrorLoggedAt[dedupeKey];
+    if (last != null && now.difference(last) < _kTvErrorDedupeWindow) return;
+    _lastTvErrorLoggedAt[dedupeKey] = now;
+
+    try {
+      await _firestore.collection('businesses/$kBusinessId/clientLogs').add({
+        'type': 'TV_ERROR',
+        'source': 'AndroidTvKioskDisplay',
+        'deviceId': deviceId,
+        'message': message.length > 2000 ? message.substring(0, 2000) : message,
+        'stackTrace': null,
+        'userId': null,
+        'userEmail': null,
+        'userAgent': 'android-tv-kiosk',
+        'appUrl': 'android-tv://kitchen-display',
+        'flavor': 'production',
+        'createdAt': FieldValue.serverTimestamp(),
+        'expireAt': Timestamp.fromDate(now.add(const Duration(days: 7))),
+        'schemaVersion': 1,
+      }).timeout(_kHeartbeatCallTimeout);
+    } catch (e) {
+      // Best-effort, same reasoning as every other write in this file — a
+      // failure to log a bug must never itself become a blocking error.
+      debugPrint('kitchen TV_ERROR log write failed: $e');
+    }
+  }
+
+  /// Called by the screen right before it triggers an app restart (watchdog
+  /// or manual long-press) — deliberately `await`ed by the caller, unlike
+  /// [_logTvError]'s other call sites, so the write gets a real chance to
+  /// reach the server before the process dies moments later.
+  Future<void> logRestartEvent(String reason) async {
+    final deviceId = _deviceId;
+    if (deviceId == null) return; // heartbeat never started — nothing to attribute this to
+    await _logTvError(deviceId, 'restart: $reason');
   }
 
   Future<void> _runHeartbeat(String deviceId) async {

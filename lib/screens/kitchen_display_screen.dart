@@ -185,6 +185,7 @@ class _KitchenDisplayScreenState extends State<KitchenDisplayScreen>
       // Same reasoning: never let a wedged/slow write to shared_preferences
       // delay the actual restart below.
     }
+    await _service.logRestartEvent('watchdog: stale for over 8 minutes');
     await AppRestart.restart();
   }
 
@@ -198,9 +199,10 @@ class _KitchenDisplayScreenState extends State<KitchenDisplayScreen>
       // — e.g. a transient focus loss mid-press — can't leave a stale
       // non-null reference that silently blocks every future long-press via
       // the `??=` below.
-      _longPressTimer ??= Timer(const Duration(seconds: 3), () {
+      _longPressTimer ??= Timer(const Duration(seconds: 3), () async {
         _longPressTimer = null;
-        AppRestart.restart();
+        await _service.logRestartEvent('manual long-press');
+        await AppRestart.restart();
       });
     } else if (event is KeyUpEvent) {
       _longPressTimer?.cancel();
